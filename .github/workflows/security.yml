@@ -1,0 +1,43 @@
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Roda govulncheck toda segunda 09:00 UTC mesmo sem commits — vulns
+    # novas no GOVULNDB aparecem entre PRs, então scheduled scan pega o
+    # delta. Complementa o Renovate (que cuida da atualização propriamente).
+    - cron: "0 9 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    # Non-blocking: reporta vulns sem falhar o build (camada de defesa
+    # complementar ao Renovate). Promover pra blocking quando o baseline
+    # de vulns estiver zerado e o time tiver SLA pra reagir.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
