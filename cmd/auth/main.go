@@ -1,22 +1,16 @@
 // viralefy_auth — serviço de identidade do Viralefy.
 //
-// Responsabilidades (escopo Fase 9b):
-//   - Mint + verify de JWT (RS256)
+// Responsabilidades:
+//   - Mint + verify de JWT (RS256 + JWKS público)
 //   - Login / Register / Refresh / Logout
 //   - 2FA TOTP (enroll, verify, disable, backup codes)
 //   - Password reset (request + confirm)
-//   - Audit log de eventos de auth (succesful login, failed, 2fa events)
-//   - Hot-set de revogação via tabela revoked_jtis (não memória)
-//   - Expor JWKS público pra verificadores externos
+//   - Hot-set de revogação via tabela revoked_jtis
 //
 // Princípios:
 //   - Superfície mínima. Sem business logic além de identidade.
-//   - Bind loopback :8083 — não exposto na internet. Caddy + api dispatcher
-//     fazem proxy seletivo das rotas públicas.
+//   - Bind loopback :8083 — não exposto na internet.
 //   - INTERNAL_SHARED_SECRET em todo request entre api↔auth e core↔auth.
-//   - Log estruturado de TODAS tentativas de auth (sucesso e falha).
-//   - Chave RS256 mestre carregada de /etc/viralefy/keys/jwt-rs256.pem
-//     (mesma do core durante janela de cutover ≤14d).
 package main
 
 import (
@@ -29,7 +23,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Viralefy/viralefy_auth/internal/application"
 	"github.com/Viralefy/viralefy_auth/internal/config"
+	"github.com/Viralefy/viralefy_auth/internal/infrastructure/jwtkeys"
+	"github.com/Viralefy/viralefy_auth/internal/infrastructure/persistence/postgres"
+	authhttp "github.com/Viralefy/viralefy_auth/internal/interface/http"
 )
 
 func main() {
@@ -42,51 +40,106 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
-	// CLI subcommands (mesmo pattern do core).
+	// CLI subcommands.
 	if len(os.Args) >= 2 {
 		switch os.Args[1] {
-		case "migrate":
-			logger.Info("migrate command not implemented yet — schema shared with viralefy_core (single Postgres)")
-			os.Exit(0)
 		case "version":
 			logger.Info("viralefy-auth version", "version", appVersion())
-			os.Exit(0)
+			return
 		}
 	}
 
-	// HTTP server scaffold — handlers reais entram nos próximos commits.
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status":"ok","service":"viralefy-auth","stage":"scaffold"}`))
+	// Hard-required pra subir o stack completo.
+	if cfg.DatabaseURL == "" {
+		log.Fatal("DATABASE_URL is required")
+	}
+	if cfg.InternalSharedSecret == "" {
+		log.Fatal("INTERNAL_SHARED_SECRET is required")
+	}
+
+	ctx := context.Background()
+
+	// Postgres.
+	db, err := postgres.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Fatalf("db connect: %v", err)
+	}
+	defer db.Close()
+	if err := db.AssertSchema(ctx); err != nil {
+		log.Fatalf("schema assert: %v", err)
+	}
+
+	// JWT keys.
+	priv, err := jwtkeys.LoadOrGenerate(cfg.JWTPrivateKeyPath)
+	if err != nil {
+		log.Fatalf("jwt key: %v", err)
+	}
+
+	// TTLs.
+	accessTTL, err := time.ParseDuration(cfg.AccessTokenTTL)
+	if err != nil {
+		log.Fatalf("invalid VAUTH_ACCESS_TOKEN_TTL: %v", err)
+	}
+	refreshTTL, err := time.ParseDuration(cfg.RefreshTokenTTL)
+	if err != nil {
+		log.Fatalf("invalid VAUTH_REFRESH_TOKEN_TTL: %v", err)
+	}
+
+	// Repos.
+	userRepo := postgres.NewUserRepo(db)
+	adminRepo := postgres.NewAdminRepo(db)
+	refreshRepo := postgres.NewRefreshTokenRepo(db)
+	revokedRepo := postgres.NewRevokedJTIRepo(db)
+	passResetRepo := postgres.NewPasswordResetRepo(db)
+	twofaRepo := postgres.NewTwoFARepo(db)
+
+	// TwoFA encryption key — pode estar vazia em scaffold, mas é hard-required
+	// pra enroll/verify de 2FA funcionar. Avisamos no log se faltar.
+	encKey := []byte(cfg.TwoFAEncKey)
+	if len(encKey) == 0 {
+		logger.Warn("TWOFA_ENCRYPTION_KEY empty — 2FA endpoints will fail at runtime")
+	}
+
+	// Services.
+	tokenSvc := application.NewTokenService(application.TokenServiceConfig{
+		PrivKey:       priv,
+		AccessTTL:     accessTTL,
+		RefreshTTL:    refreshTTL,
+		RefreshTokens: refreshRepo,
+		RevokedJTIs:   revokedRepo,
 	})
-	mux.HandleFunc("/internal/v1/ready", func(w http.ResponseWriter, r *http.Request) {
-		// Próxima fase: ping DB + check key file existence
-		w.Write([]byte(`{"ready":true}`))
-	})
+	authSvc := application.NewAuthService(userRepo, adminRepo, twofaRepo, passResetRepo, tokenSvc, encKey)
+
+	// HTTP.
+	h := &authhttp.Handlers{Auth: authSvc}
+	router := authhttp.NewRouter(h, cfg.InternalSharedSecret)
 
 	srv := &http.Server{
 		Addr:              cfg.BindAddr,
-		Handler:           mux,
+		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       90 * time.Second,
 	}
 
-	// Graceful shutdown (SIGTERM = systemd stop).
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	// Graceful shutdown.
+	ctx2, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
-		logger.Info("viralefy-auth listening", "addr", cfg.BindAddr, "stage", "scaffold")
+		logger.Info("viralefy-auth listening",
+			"addr", cfg.BindAddr,
+			"jwt_kid", jwtkeys.KeyID(priv),
+			"access_ttl", accessTTL.String(),
+			"refresh_ttl", refreshTTL.String())
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("http server error", "error", err.Error())
 			os.Exit(1)
 		}
 	}()
 
-	<-ctx.Done()
+	<-ctx2.Done()
 	logger.Info("shutting down")
 	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
