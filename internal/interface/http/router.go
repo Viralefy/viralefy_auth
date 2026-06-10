@@ -33,5 +33,15 @@ func NewRouter(h *Handlers, internalSecret string) http.Handler {
 	mux.Handle("POST /internal/v1/twofa/verify", auth(http.HandlerFunc(h.TwoFAVerify)))
 	mux.Handle("POST /internal/v1/twofa/disable", auth(http.HandlerFunc(h.TwoFADisable)))
 
+	// ─── Rotas públicas (sem X-Internal-Token) ──────────────────────
+	// Espelham o legacy api pro dispatcher fazer cutover sem mudar contrato
+	// com front/backoffice. Rate-limit por IP (10/15min) feito nos handlers.
+	mux.HandleFunc("POST /v1/auth/user/register", h.PublicUserRegister)
+	mux.HandleFunc("POST /v1/auth/user/login", h.PublicUserLogin)
+	mux.HandleFunc("POST /v1/auth/user/login/2fa", h.PublicLogin2FA)
+	mux.HandleFunc("POST /v1/auth/login", h.PublicAdminLogin)
+	mux.HandleFunc("POST /v1/auth/login/2fa", h.PublicLogin2FA)
+	mux.HandleFunc("POST /v1/auth/login/2fa/enroll", h.PublicAdminEnroll2FA)
+
 	return mux
 }
