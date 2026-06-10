@@ -26,6 +26,7 @@ import (
 	"github.com/Viralefy/viralefy_auth/internal/application"
 	"github.com/Viralefy/viralefy_auth/internal/config"
 	"github.com/Viralefy/viralefy_auth/internal/infrastructure/jwtkeys"
+	"github.com/Viralefy/viralefy_auth/internal/infrastructure/observability"
 	"github.com/Viralefy/viralefy_auth/internal/infrastructure/persistence/postgres"
 	authhttp "github.com/Viralefy/viralefy_auth/internal/interface/http"
 )
@@ -56,6 +57,10 @@ func main() {
 	if cfg.InternalSharedSecret == "" {
 		log.Fatal("INTERNAL_SHARED_SECRET is required")
 	}
+
+	// Prometheus collectors — registrados antes de servir requests pra
+	// /internal/metrics não 404ar enquanto handlers ainda warming up.
+	observability.InitMetrics()
 
 	ctx := context.Background()
 

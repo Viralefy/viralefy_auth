@@ -2,6 +2,8 @@ package http
 
 import (
 	"net/http"
+
+	"github.com/Viralefy/viralefy_auth/internal/infrastructure/observability"
 )
 
 // NewRouter monta o mux com middleware InternalTokenAuth aplicado em
@@ -13,6 +15,11 @@ func NewRouter(h *Handlers, internalSecret string) http.Handler {
 	// Aberto: health/ready
 	mux.HandleFunc("GET /internal/v1/health", h.Health)
 	mux.HandleFunc("GET /internal/v1/ready", h.Ready)
+
+	// /internal/metrics: Prometheus scrape (loopback-only via bind 127.0.0.1:8083).
+	// Sem X-Internal-Token pra simplificar config do Prometheus — o bind já
+	// restringe acesso à interface privada da VPS.
+	mux.Handle("GET /internal/metrics", observability.MetricsHandler())
 
 	// Aberto: JWKS público
 	mux.HandleFunc("GET /.well-known/jwks.json", h.JWKS)
@@ -43,5 +50,7 @@ func NewRouter(h *Handlers, internalSecret string) http.Handler {
 	mux.HandleFunc("POST /v1/auth/login/2fa", h.PublicLogin2FA)
 	mux.HandleFunc("POST /v1/auth/login/2fa/enroll", h.PublicAdminEnroll2FA)
 
-	return mux
+	// Wrap em ObservabilityMiddleware pra todas as rotas (inclusive /metrics
+	// — barato e mantém self-observation simétrica entre serviços).
+	return observability.HTTPMiddleware(mux)
 }
