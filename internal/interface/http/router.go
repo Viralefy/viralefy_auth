@@ -15,6 +15,11 @@ func NewRouter(h *Handlers, internalSecret string) http.Handler {
 	// Aberto: health/ready
 	mux.HandleFunc("GET /internal/v1/health", h.Health)
 	mux.HandleFunc("GET /internal/v1/ready", h.Ready)
+	// /health: alias unificado (PHASE-10 — 2026-06-11). Reusa o mesmo handler
+	// pra que viralefy-smoke + probes externos convirjam num único path em
+	// todos os services. /internal/v1/health continua respondendo por
+	// backward compat (systemd probes, dashboards antigos).
+	mux.HandleFunc("GET /health", h.Health)
 
 	// /internal/metrics: Prometheus scrape (loopback-only via bind 127.0.0.1:8083).
 	// Sem X-Internal-Token pra simplificar config do Prometheus — o bind já
