@@ -15,11 +15,15 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -98,11 +102,15 @@ func main() {
 	passResetRepo := postgres.NewPasswordResetRepo(db)
 	twofaRepo := postgres.NewTwoFARepo(db)
 
-	// TwoFA encryption key — pode estar vazia em scaffold, mas é hard-required
-	// pra enroll/verify de 2FA funcionar. Avisamos no log se faltar.
-	encKey := []byte(cfg.TwoFAEncKey)
-	if len(encKey) == 0 {
-		logger.Warn("TWOFA_ENCRYPTION_KEY empty — 2FA endpoints will fail at runtime")
+	// TwoFA encryption key — aceita hex (64 chars) ou base64 (44/43 chars).
+	// AES-256-GCM exige exatamente 32 bytes (256 bits) decodificados; passar
+	// a string raw ([]byte do hex) gerava 64 bytes e Decrypt falhava com
+	// "key must be 32 bytes" → 500 no /v1/auth/user/login/2fa. Espelha o
+	// formato parse2FAKey do viralefy_core pra os 2 services usarem a MESMA
+	// chave canônica.
+	encKey, err := parse2FAKey(cfg.TwoFAEncKey)
+	if err != nil {
+		logger.Warn("TWOFA_ENCRYPTION_KEY inválida — 2FA endpoints retornarão 500", slog.String("error", err.Error()))
 	}
 
 	// Services.
@@ -156,4 +164,26 @@ func appVersion() string {
 		return v
 	}
 	return "dev"
+}
+
+// parse2FAKey aceita hex 64 chars OU base64 44 (com padding) / 43 (sem).
+// Espelha viralefy_core/internal/config.parse2FAKey — manter sincronizado.
+// Retorna []byte len=32 ou erro.
+func parse2FAKey(s string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, fmt.Errorf("empty")
+	}
+	if len(s) == 64 {
+		if b, err := hex.DecodeString(s); err == nil && len(b) == 32 {
+			return b, nil
+		}
+	}
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil && len(b) == 32 {
+		return b, nil
+	}
+	if b, err := base64.RawStdEncoding.DecodeString(s); err == nil && len(b) == 32 {
+		return b, nil
+	}
+	return nil, fmt.Errorf("TWOFA_ENCRYPTION_KEY must decode to 32 bytes (hex 64 or base64 44/43 chars)")
 }
