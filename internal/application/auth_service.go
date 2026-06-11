@@ -74,39 +74,68 @@ type AdminView struct {
 	Permissions []string // populado pelo caller via roles repo no core; aqui vazio
 }
 
-// LoginUser autentica um user (loja). Email + senha; se 2FA enrolled,
-// devolve PartialToken pra cliente chamar /login/2fa.
+// LoginUser autentica via /v1/auth/user/login — endpoint UNIFICADO da loja.
+//
+// Identidade unificada (2026-06-11): admin não é uma tabela separada de
+// usuário comum, é um usuário com PERMISSÕES. Por isso esse handler tenta:
+//
+//   1. users.GetByEmail(email)  — caminho normal do cliente da loja
+//   2. Se não achou ou senha não bate → admins.GetByEmail(email) (mesma senha)
+//
+// Quando o login bate na tabela admins, devolvemos a sessão com Kind=admin +
+// AdminView, EXATAMENTE igual ao /v1/auth/login. O front decide redirect
+// (usuário comum → /account, admin → /account + UI extra). O token é o
+// mesmo formato em ambos os casos; permissões vêm do role no JWT.
+//
+// 2FA: respeita a tabela twofa por user_id, e RequiresTwoFA por admin (config
+// no DB). Anti-enum: returns ErrUnauthorized indistinguishable para email
+// não encontrado, senha errada ou admin/user soft-deleted.
 func (s *AuthService) LoginUser(ctx context.Context, email, password, ip, ua string) (*LoginResult, error) {
 	email = strings.TrimSpace(strings.ToLower(email))
 	if email == "" || password == "" {
 		return nil, domain.ErrInvalidInput
 	}
-	u, err := s.users.GetByEmail(ctx, email)
-	if err != nil || u == nil {
-		// Mesmo erro pra not-found e bad-password (anti-enum).
-		return nil, domain.ErrUnauthorized
-	}
-	if u.DeletedAt != nil {
-		return nil, domain.ErrUnauthorized
-	}
-	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)); err != nil {
-		return nil, domain.ErrUnauthorized
-	}
-	if t, _ := s.twofa.GetByUserID(ctx, u.ID); t != nil && t.IsEnrolled() {
-		pt, err := s.tokens.MintPartial2FA(domain.Subject{Kind: domain.SubjectUser, UserID: u.ID})
-		if err != nil {
-			return nil, err
+
+	// Tentativa 1: tabela users (cliente da loja).
+	u, _ := s.users.GetByEmail(ctx, email)
+	if u != nil && u.DeletedAt == nil {
+		if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)); err == nil {
+			// Senha bate como user — segue flow normal de user.
+			if t, _ := s.twofa.GetByUserID(ctx, u.ID); t != nil && t.IsEnrolled() {
+				pt, err := s.tokens.MintPartial2FA(domain.Subject{Kind: domain.SubjectUser, UserID: u.ID})
+				if err != nil {
+					return nil, err
+				}
+				return &LoginResult{PartialToken: pt, TwoFARequired: true}, nil
+			}
+			sess, err := s.tokens.MintForUser(ctx, *u, ip, ua)
+			if err != nil {
+				return nil, err
+			}
+			return &LoginResult{Session: sess, UserView: userView(u)}, nil
 		}
-		return &LoginResult{PartialToken: pt, TwoFARequired: true}, nil
 	}
-	sess, err := s.tokens.MintForUser(ctx, *u, ip, ua)
-	if err != nil {
-		return nil, err
+
+	// Tentativa 2: tabela admins (mesma porta, role embutido no token).
+	if a, _ := s.admins.GetByEmail(ctx, email); a != nil {
+		if err := bcrypt.CompareHashAndPassword([]byte(a.PasswordHash), []byte(password)); err == nil {
+			if a.RequiresTwoFA {
+				pt, err := s.tokens.MintPartial2FA(domain.Subject{Kind: domain.SubjectAdmin, AdminID: a.ID})
+				if err != nil {
+					return nil, err
+				}
+				return &LoginResult{PartialToken: pt, TwoFARequired: true}, nil
+			}
+			sess, err := s.tokens.MintForAdmin(ctx, *a, ip, ua)
+			if err != nil {
+				return nil, err
+			}
+			return &LoginResult{Session: sess, AdminView: adminView(a)}, nil
+		}
 	}
-	return &LoginResult{
-		Session:  sess,
-		UserView: userView(u),
-	}, nil
+
+	// Nem user nem admin bateram. Resposta opaca (anti-enum).
+	return nil, domain.ErrUnauthorized
 }
 
 // LoginAdmin autentica admin. RequiresTwoFA (config no DB) = sempre PartialToken.
