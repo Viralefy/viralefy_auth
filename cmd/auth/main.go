@@ -120,6 +120,10 @@ func main() {
 		RefreshTTL:    refreshTTL,
 		RefreshTokens: refreshRepo,
 		RevokedJTIs:   revokedRepo,
+		// Round 25 HIGH fix: Refresh re-busca role/email reais do
+		// user/admin pra não re-emitir token com role default genérico.
+		Users:         userRepo,
+		Admins:        adminRepo,
 	})
 	authSvc := application.NewAuthService(userRepo, adminRepo, twofaRepo, passResetRepo, tokenSvc, encKey)
 

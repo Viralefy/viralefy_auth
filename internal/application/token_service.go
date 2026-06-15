@@ -12,6 +12,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -22,6 +23,44 @@ import (
 	"github.com/google/uuid"
 )
 
+// Identidade canônica do emissor e públicos esperados.
+//
+// `iss` (issuer) — quem assinou. Único no ecossistema: o próprio viralefy_auth.
+// `aud` (audience) — quem PODE consumir. Tokens de access carregam todos os
+// consumidores legítimos (`viralefy-api`, `viralefy-core`, `viralefy-payments`,
+// `viralefy-sender`) e cada verificador valida com SEU próprio audience esperado.
+// Partial tokens 2FA só circulam DENTRO do viralefy_auth → audience self.
+//
+// §14 dos padrões: JWT validado por inteiro inclui `iss` e `aud` contra
+// allowlist explícita. Sem isso, token emitido p/ serviço A pode ser aceito
+// por serviço B (confused deputy / cross-service replay).
+const (
+	JWTIssuer = "viralefy-auth"
+
+	// AudiencePartial2FA — partial token só é consumido pelo próprio auth no
+	// endpoint /login/2fa. Não deve ser aceito em lugar nenhum.
+	AudiencePartial2FA = "viralefy-auth"
+
+	// AudienceAPI, AudienceCore, AudiencePayments, AudienceSender — consumidores
+	// internos do access token. O TokenService emite tokens válidos para todos
+	// eles; cada verificador valida contra o SEU próprio nome.
+	AudienceAPI      = "viralefy-api"
+	AudienceCore     = "viralefy-core"
+	AudiencePayments = "viralefy-payments"
+	AudienceSender   = "viralefy-sender"
+)
+
+// AccessAudiences é a lista incluída no claim `aud` dos access tokens.
+// Múltiplos audiences são permitidos pela RFC 7519 §4.1.3 (array de strings).
+var AccessAudiences = []string{AudienceAPI, AudienceCore, AudiencePayments, AudienceSender}
+
+// allowedAlgs — allowlist explícita §14. SEM isso, atacante pode tentar
+// `alg=none` (token "válido" sem assinatura) ou forçar downgrade pra HMAC
+// usando a chave pública RSA como secret. golang-jwt/v5 já trata `none`
+// como SigningMethodNone (não casa com RSA/HMAC), mas a allowlist torna
+// explícito e à prova de regressão.
+var allowedAlgs = []string{"RS256", "HS256"}
+
 type TokenService struct {
 	priv            *rsa.PrivateKey
 	kid             string
@@ -30,6 +69,15 @@ type TokenService struct {
 	refreshTTL      time.Duration
 	refreshTokens   domain.RefreshTokenRepository
 	revokedJTIs     domain.RevokedJTIRepository
+	// users/admins — usados por Refresh pra re-buscar role/email reais do
+	// dono do refresh token. Sem isso, /refresh re-emitia com role genérico
+	// ("admin", "user"), o que apaga o nível real (superadmin, manager,
+	// support, viewer): perda de privilégio na melhor hipótese, escalada
+	// disfarçada na pior. Construção opcional pra não quebrar testes legados
+	// que instanciam TokenService só pra exercitar mint/verify; quando nil,
+	// Refresh devolve ErrUnauthorized (fail-closed).
+	users           domain.UserRepository
+	admins          domain.AdminRepository
 }
 
 type TokenServiceConfig struct {
@@ -39,6 +87,10 @@ type TokenServiceConfig struct {
 	RefreshTTL      time.Duration
 	RefreshTokens   domain.RefreshTokenRepository
 	RevokedJTIs     domain.RevokedJTIRepository
+	// Users/Admins — ver doc do struct TokenService. Injetados no wiring
+	// (cmd/auth/main.go) ao lado dos demais repos.
+	Users           domain.UserRepository
+	Admins          domain.AdminRepository
 }
 
 func NewTokenService(cfg TokenServiceConfig) *TokenService {
@@ -50,6 +102,8 @@ func NewTokenService(cfg TokenServiceConfig) *TokenService {
 		refreshTTL:    cfg.RefreshTTL,
 		refreshTokens: cfg.RefreshTokens,
 		revokedJTIs:   cfg.RevokedJTIs,
+		users:         cfg.Users,
+		admins:        cfg.Admins,
 	}
 }
 
@@ -92,6 +146,9 @@ func (s *TokenService) MintForAdmin(ctx context.Context, a domain.Admin, issueIP
 
 // MintPartial2FA emite um token curto (5min) usado entre /login com 2FA
 // pendente e /login/2fa. Preserva comportamento do core legacy.
+//
+// `iss` = viralefy-auth (§14); `aud` = viralefy-auth (consumido só pelo
+// próprio serviço — não vaza pra api/core).
 func (s *TokenService) MintPartial2FA(subj domain.Subject) (string, error) {
 	typ := "user_partial"
 	if subj.Kind == domain.SubjectAdmin {
@@ -104,6 +161,8 @@ func (s *TokenService) MintPartial2FA(subj domain.Subject) (string, error) {
 		"typ": typ,
 		"exp": exp.Unix(),
 		"iat": now.Unix(),
+		"iss": JWTIssuer,
+		"aud": AudiencePartial2FA,
 	}
 	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	if s.kid != "" {
@@ -119,12 +178,16 @@ func (s *TokenService) mint(ctx context.Context, c domain.AccessClaims, subj dom
 	c.Exp = accessExp.Unix()
 	c.Jti = uuid.New().String()
 
+	// §14 — claims `iss` e `aud` obrigatórios. `aud` lista todos os
+	// consumidores legítimos; cada serviço valida contra o SEU nome.
 	claims := jwt.MapClaims{
 		"sub": c.Sub,
 		"typ": c.Typ,
 		"exp": c.Exp,
 		"iat": c.Iat,
 		"jti": c.Jti,
+		"iss": JWTIssuer,
+		"aud": AccessAudiences,
 	}
 	if c.Role != "" {
 		claims["role"] = c.Role
@@ -172,11 +235,21 @@ func (s *TokenService) mint(ctx context.Context, c domain.AccessClaims, subj dom
 	}, nil
 }
 
-// VerifyAccess valida assinatura + exp + hot-set de revogação.
+// VerifyAccess valida assinatura + exp + iss + aud + hot-set de revogação.
 // Retorna claims tipadas ou um erro canônico (ErrTokenExpired,
 // ErrTokenRevoked, ErrTokenMalformed, ErrUnauthorized).
-func (s *TokenService) VerifyAccess(ctx context.Context, raw string) (*domain.AccessClaims, error) {
-	t, err := s.parseDualSign(raw)
+//
+// `expectedAudience` é o nome do CONSUMIDOR que está chamando este Verify
+// (ex.: "viralefy-api"). Token sem esse audience na lista `aud` é rejeitado.
+// Vazio = aceita qualquer audience da AccessAudiences (uso interno do auth
+// p/ revogação/inspeção); em borda externa, SEMPRE passar o nome do consumer.
+func (s *TokenService) VerifyAccess(ctx context.Context, raw, expectedAudience string) (*domain.AccessClaims, error) {
+	if expectedAudience == "" {
+		// Fallback inseguro só pra uso interno: aceita o primeiro audience
+		// da lista (todos os tokens do auth carregam o conjunto inteiro).
+		expectedAudience = AudienceAPI
+	}
+	t, err := s.parseDualSign(raw, expectedAudience)
 	if err != nil {
 		return nil, err
 	}
@@ -237,19 +310,67 @@ func (s *TokenService) Refresh(ctx context.Context, refreshRaw, issueIP, ua stri
 		_ = s.refreshTokens.RevokeBySubject(ctx, subj)
 		return nil, domain.ErrTokenRevoked
 	}
-	// Mint novo.
+	// Mint novo. ANTES era emitido com role/typ derivado só do Kind
+	// (string(subj.Kind) virava "admin" pra TODO admin) — apagava o role
+	// real (superadmin/manager/support/viewer) e o email. Resultado:
+	// admin com role="superadmin" virava role="admin" no primeiro /refresh
+	// e perdia privilégio (caminho feliz) ou — pior — passava a render
+	// "admin" genérico onde a autorização downstream esperava role
+	// específico, abrindo brecha de escalada/erro de gate.
+	//
+	// Correção (round 25, HIGH severity): re-buscar user/admin pelo ID
+	// que veio com o refresh token e mintar com role/email REAIS. Se a
+	// conta foi deletada/desativada entre issue e refresh, devolve
+	// ErrUnauthorized — sessão revogada, sem mint.
 	var subj domain.Subject
 	if existing.UserID != nil {
 		subj = domain.Subject{Kind: domain.SubjectUser, UserID: *existing.UserID}
 	} else if existing.AdminID != nil {
 		subj = domain.Subject{Kind: domain.SubjectAdmin, AdminID: *existing.AdminID}
+	} else {
+		// Refresh token órfão (sem user_id nem admin_id) — bug de dado,
+		// nunca confiar. Fail-closed.
+		return nil, domain.ErrUnauthorized
 	}
-	// Não temos email/role aqui — quem chamou /refresh passa os dados
-	// re-buscando no repo de user/admin. Pra interface limpa, retornamos
-	// só o subject; handler decide se busca metadata. Implementação
-	// suficiente pra dispatcher: emite token com role default (lookup
-	// é responsabilidade do handler real).
-	claims := domain.AccessClaims{Sub: subj.ID(), Typ: string(subj.Kind), Role: string(subj.Kind)}
+
+	var claims domain.AccessClaims
+	switch subj.Kind {
+	case domain.SubjectAdmin:
+		if s.admins == nil {
+			// Wiring incompleto — fail-closed em vez de mintar com role default.
+			return nil, domain.ErrUnauthorized
+		}
+		a, err := s.admins.GetByID(ctx, subj.AdminID)
+		if err != nil || a == nil {
+			// Admin deletado/desativado entre issue do refresh e este /refresh.
+			// Trate como sessão revogada — não mint, não vaze diferença vs.
+			// "não autorizado" pro caller.
+			return nil, domain.ErrUnauthorized
+		}
+		claims = domain.AccessClaims{
+			Sub:   a.ID,
+			Typ:   "admin",
+			Role:  a.Role,
+			Email: a.Email,
+		}
+	case domain.SubjectUser:
+		if s.users == nil {
+			return nil, domain.ErrUnauthorized
+		}
+		u, err := s.users.GetByID(ctx, subj.UserID)
+		if err != nil || u == nil || u.DeletedAt != nil {
+			return nil, domain.ErrUnauthorized
+		}
+		claims = domain.AccessClaims{
+			Sub:   u.ID,
+			Typ:   "user",
+			Role:  "user",
+			Email: u.Email,
+		}
+	default:
+		return nil, domain.ErrUnauthorized
+	}
+
 	session, err := s.mint(ctx, claims, subj, issueIP, ua)
 	if err != nil {
 		return nil, err
@@ -291,8 +412,11 @@ func (s *TokenService) Logout(ctx context.Context, refreshRaw, accessJTI string,
 // ParsePartialToken é utility pra validar partial_token e devolver subject.
 // 2FA flow: /login (pwd OK + 2FA enabled) → MintPartial2FA → /login/2fa
 // chama isso pra extrair subject e validar TOTP.
+//
+// Valida com audience = AudiencePartial2FA (self) — partial token NÃO
+// é aceito como access token e vice-versa.
 func (s *TokenService) ParsePartialToken(raw string) (domain.Subject, error) {
-	t, err := s.parseDualSign(raw)
+	t, err := s.parseDualSign(raw, AudiencePartial2FA)
 	if err != nil {
 		return domain.Subject{}, err
 	}
@@ -309,8 +433,36 @@ func (s *TokenService) ParsePartialToken(raw string) (domain.Subject, error) {
 }
 
 // parseDualSign aceita RS256 primário + HS256 legado durante migração.
-func (s *TokenService) parseDualSign(raw string) (*jwt.Token, error) {
-	t, err := jwt.Parse(raw, func(t *jwt.Token) (interface{}, error) {
+//
+// Hardening §14 (round 24 HIGH):
+//   - WithValidMethods: allowlist explícita ("RS256","HS256"). Atacante NÃO
+//     consegue forjar `alg=none` nem outras variantes (RS384/PS256/etc.)
+//     mesmo se a keyfunc por engano retornar uma chave. Defesa em profundidade
+//     além do switch de tipo.
+//   - WithIssuer: rejeita token assinado pela MESMA chave mas com `iss`
+//     diferente (ex.: outro serviço da casa que compartilhou a chave por
+//     engano, ou pre-mudança onde `iss` não existia).
+//   - WithAudience(expectedAudience): rejeita token cujo `aud` não inclui
+//     o consumidor que está validando. Evita confused-deputy (token de
+//     partial2FA aceito como access; token p/ payments aceito pelo core).
+//   - WithExpirationRequired: token sem `exp` é rejeitado. golang-jwt/v5
+//     aceita por default ausência de exp; aqui exigimos sempre.
+//
+// O switch interno na keyfunc continua sendo a primeira linha de defesa
+// (retorna a chave certa por método e bloqueia HS256 quando legacy=off).
+// A allowlist na Parser é a SEGUNDA linha — defense in depth.
+func (s *TokenService) parseDualSign(raw, expectedAudience string) (*jwt.Token, error) {
+	opts := []jwt.ParserOption{
+		jwt.WithValidMethods(allowedAlgs),
+		jwt.WithIssuer(JWTIssuer),
+		jwt.WithExpirationRequired(),
+	}
+	if expectedAudience != "" {
+		opts = append(opts, jwt.WithAudience(expectedAudience))
+	}
+	parser := jwt.NewParser(opts...)
+
+	t, err := parser.Parse(raw, func(t *jwt.Token) (interface{}, error) {
 		switch t.Method.(type) {
 		case *jwt.SigningMethodRSA:
 			return &s.priv.PublicKey, nil
@@ -324,10 +476,20 @@ func (s *TokenService) parseDualSign(raw string) (*jwt.Token, error) {
 		}
 	})
 	if err != nil {
+		// golang-jwt/v5 expõe erros canônicos via errors.Is — preferir isso
+		// a strings.Contains, que é frágil a mudanças de mensagem.
 		switch {
-		case strings.Contains(err.Error(), "expired"):
+		case errors.Is(err, jwt.ErrTokenExpired):
 			return nil, domain.ErrTokenExpired
-		case strings.Contains(err.Error(), "malformed"), strings.Contains(err.Error(), "unsupported"):
+		case errors.Is(err, jwt.ErrTokenMalformed),
+			errors.Is(err, jwt.ErrTokenUnverifiable),
+			errors.Is(err, jwt.ErrTokenSignatureInvalid),
+			errors.Is(err, jwt.ErrTokenInvalidAudience),
+			errors.Is(err, jwt.ErrTokenInvalidIssuer),
+			errors.Is(err, jwt.ErrTokenRequiredClaimMissing):
+			return nil, domain.ErrTokenMalformed
+		case strings.Contains(err.Error(), "unsupported"),
+			strings.Contains(err.Error(), "signing method"):
 			return nil, domain.ErrTokenMalformed
 		default:
 			return nil, domain.ErrUnauthorized

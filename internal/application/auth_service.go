@@ -307,7 +307,7 @@ func (s *AuthService) Enroll2FA(ctx context.Context, subj domain.Subject) (*Enro
 	}
 	hashes := make([]string, 0, len(codes))
 	for _, c := range codes {
-		h, err := bcrypt.GenerateFromPassword([]byte(c), 10)
+		h, err := bcrypt.GenerateFromPassword([]byte(c), BackupCodeCost)
 		if err != nil {
 			return nil, err
 		}

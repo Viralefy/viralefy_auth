@@ -14,6 +14,12 @@ import (
 
 const bcryptCost = 12
 
+// BackupCodeCost é o cost factor do bcrypt para os hashes de backup codes
+// de 2FA. Backup codes são senha-equivalentes (1 código = bypass total do
+// segundo fator), então não há razão pra economizar rounds aqui. Igualado
+// ao bcryptCost da senha (12).
+const BackupCodeCost = 12
+
 // HashPassword wrappa bcrypt com cost padrão do projeto.
 func HashPassword(pwd string) (string, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(pwd), bcryptCost)

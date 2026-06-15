@@ -167,7 +167,10 @@ func (h *Handlers) Logout(w http.ResponseWriter, r *http.Request) {
 	if req.AccessToken != "" {
 		// Verify aceita revogados/expirados pra extrair claims (logout idempotente).
 		// Aqui usamos VerifyAccess que rejeita revogados — fallback parseclaims sem verify? Keep simple.
-		if c, err := h.Auth.Tokens().VerifyAccess(r.Context(), req.AccessToken); err == nil || errors.Is(err, domain.ErrTokenRevoked) {
+		// Logout: passa audience vazio → service usa fallback interno
+		// (AudienceAPI). Tokens emitidos pelo auth carregam todos os
+		// audiences da AccessAudiences, então qualquer um casa.
+		if c, err := h.Auth.Tokens().VerifyAccess(r.Context(), req.AccessToken, ""); err == nil || errors.Is(err, domain.ErrTokenRevoked) {
 			accessJTI = c.Jti
 			accessExp = time.Unix(c.Exp, 0)
 		}
@@ -182,6 +185,12 @@ func (h *Handlers) Logout(w http.ResponseWriter, r *http.Request) {
 
 type verifyRequest struct {
 	Token string `json:"token"`
+	// Audience — nome do consumidor que está validando o token (ex.:
+	// "viralefy-api", "viralefy-core"). Verify rejeita o token se esse
+	// audience não estiver no claim `aud`. Vazio = fallback inseguro
+	// (apenas pra dispatcher legado durante cutover; trocar pra audience
+	// explícito após Fase 9b).
+	Audience string `json:"audience,omitempty"`
 }
 
 type verifyResponse struct {
@@ -196,7 +205,7 @@ func (h *Handlers) TokenVerify(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, verifyResponse{Valid: false, Error: "invalid_input"})
 		return
 	}
-	c, err := h.Auth.Tokens().VerifyAccess(r.Context(), req.Token)
+	c, err := h.Auth.Tokens().VerifyAccess(r.Context(), req.Token, req.Audience)
 	if err != nil {
 		writeJSON(w, http.StatusOK, verifyResponse{Valid: false, Error: err.Error()})
 		return
