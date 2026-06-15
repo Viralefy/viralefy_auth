@@ -23,8 +23,11 @@ func (r *UserRepo) GetByID(ctx context.Context, id string) (*domain.User, error)
 	return scanUser(row)
 }
 
+// GetByEmail retorna apenas users ATIVOS. Soft-deletados ficam invisíveis pra
+// auth (login, register-conflict-check, recovery), permitindo reuso do email
+// após exclusão LGPD (Art. 18 IV). Migration 047 reforça com índice parcial.
 func (r *UserRepo) GetByEmail(ctx context.Context, email string) (*domain.User, error) {
-	row := r.db.pool.QueryRow(ctx, `SELECT `+userCols+` FROM users WHERE email=$1`, email)
+	row := r.db.pool.QueryRow(ctx, `SELECT `+userCols+` FROM users WHERE email=$1 AND deleted_at IS NULL`, email)
 	return scanUser(row)
 }
 
