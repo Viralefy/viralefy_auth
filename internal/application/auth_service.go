@@ -15,6 +15,18 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// dummyBcryptHash — hash bcrypt cost 12 de uma senha aleatória fixa, usado
+// como "alvo" do CompareHashAndPassword quando o email NÃO existe (user nem
+// admin). Sem isso, o login retornava ErrUnauthorized em <1ms quando o email
+// não existia, contra 50-150ms quando existia (custo do bcrypt sobre o hash
+// real). Diferença mensurável remotamente → oráculo de enumeração de emails.
+//
+// Hash gerado UMA vez via bcrypt.GenerateFromPassword([]byte("dummy-no-one-will-guess"), 12).
+// O plaintext NÃO precisa ser segredo — o que importa é que nenhuma senha
+// real corresponda. A "senha" do atacante nunca vai bater, e como bcrypt
+// é constant-time-ish por rounds, o tempo de resposta passa a ser equivalente.
+const dummyBcryptHash = "$2a$12$JhgCM1XUCT7Hezc0L7QsBeMaRdVPt3sFhTp5qi9GN0cOK.gTmA07S"
+
 // AuthService orquestra os fluxos de identidade. Composto sobre TokenService
 // (responsável pelo crypto de JWT) + os repos. Encapsula:
 //   - Login user/admin com 2FA opcional ou obrigatório
@@ -134,7 +146,11 @@ func (s *AuthService) LoginUser(ctx context.Context, email, password, ip, ua str
 		}
 	}
 
-	// Nem user nem admin bateram. Resposta opaca (anti-enum).
+	// Nem user nem admin bateram. Resposta opaca + bcrypt fake pra equalizar
+	// timing com os caminhos onde achou hash real e comparou. Sem isso, o
+	// fast-path ErrUnauthorized retorna em <1ms enquanto um match com senha
+	// errada leva 50-150ms — o delta vira oráculo de enumeração.
+	_ = bcrypt.CompareHashAndPassword([]byte(dummyBcryptHash), []byte(password))
 	return nil, domain.ErrUnauthorized
 }
 
@@ -148,6 +164,10 @@ func (s *AuthService) LoginAdmin(ctx context.Context, email, password, ip, ua st
 	}
 	a, err := s.admins.GetByEmail(ctx, email)
 	if err != nil || a == nil {
+		// Anti-timing: equaliza com o caminho "achou admin + senha errada"
+		// (que paga o custo do bcrypt). Sem isso, /login admin enumera quais
+		// emails têm conta admin pela latência.
+		_ = bcrypt.CompareHashAndPassword([]byte(dummyBcryptHash), []byte(password))
 		return nil, domain.ErrUnauthorized
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(a.PasswordHash), []byte(password)); err != nil {
