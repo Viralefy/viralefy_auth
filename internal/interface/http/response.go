@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/Viralefy/viralefy_auth/internal/domain"
 	"github.com/google/uuid"
@@ -40,7 +41,10 @@ func writeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, domain.ErrNotFound):
 		status, code, msg = http.StatusNotFound, "NOT_FOUND", err.Error()
 	case errors.Is(err, domain.ErrConflict):
-		status, code, msg = http.StatusConflict, "CONFLICT", err.Error()
+		// Tira o sufixo ": conflict" quando o err vem de fmt.Errorf("...: %w", ErrConflict).
+		// Fica "email already registered" em vez de "email already registered: conflict".
+		status, code = http.StatusConflict, "CONFLICT"
+		msg = strings.TrimSuffix(err.Error(), ": "+domain.ErrConflict.Error())
 	case errors.Is(err, domain.ErrTwoFARequired):
 		status, code, msg = http.StatusUnauthorized, "TWOFA_REQUIRED", "two-factor authentication required"
 	case errors.Is(err, domain.ErrTwoFAAlreadyEnrolled):
