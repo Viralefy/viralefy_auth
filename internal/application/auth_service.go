@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -242,7 +243,10 @@ func (s *AuthService) RegisterUser(ctx context.Context, email, password, name, p
 		return nil, domain.ErrInvalidInput
 	}
 	if existing, _ := s.users.GetByEmail(ctx, email); existing != nil {
-		return nil, domain.ErrConflict
+		// Wrap pra preservar errors.Is(domain.ErrConflict) (response.go mapeia
+		// pra 409) mas com mensagem útil pro user — "conflict" cru gerava UX
+		// ruim no frontend (alerta dizia só "conflict", user clicava de novo).
+		return nil, fmt.Errorf("email already registered: %w", domain.ErrConflict)
 	}
 	hash, err := HashPassword(password)
 	if err != nil {
